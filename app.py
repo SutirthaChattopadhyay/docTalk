@@ -55,7 +55,56 @@ with st.sidebar:
     st.divider()
 
     st.header("Document")
-    upload_file = st.file_uploader("Choose a PDF", type="pdf")
+    uploaded_file = st.file_uploader("Choose a PDF", type="pdf")
 
     chunk_size = st.slider("chunk size (words)", 100, 1000, 500, step=50)
-    chunk_overlap = st.slider("chunk overlap ()")
+    chunk_overlap = st.slider("chunk overlap (words)", 0, 200, 50, step=10)
+    top_k = st.slider("passages to retrieve", 1, 10, 5)
+
+    if uploaded_file and st.button("Process PDF", type="primary"):
+        with st.spinner("Parsing and embedding - this takes a moment.."):
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(uploaded_file.read())
+                    tmp_path = tmp.name
+
+                chunks = parse_pdf(
+                    tmp_path, chunk_size=chunk_size, chunk_overlap=chunk_overlap
+                )    
+
+                pipeline = EmbeddingPipeline()
+                pipeline.build(chunks, show_progress=False)
+
+                st.session_state.pipeline = pipeline
+                st.session_state.doc_name = uploaded_file.name
+                st.session_state.messages = []
+
+                st.success(
+                    f"{len(chunks)} chunks indexed from **{uploaded_file.name}**"
+                )
+            except Exception as e:
+                st.error(f"Error processing PDF: {e}")
+    if st.session_state.doc_name:
+        st.info(f"Active: **{st.session_state.doc_name}**")
+
+# ------------------------------------------------------------------------------
+# Gaurds
+# ------------------------------------------------------------------------------        
+
+if not api_key:
+    st.info("Paste your Gemini API key in the sidebar to get started.")
+    st.stop()
+
+if st.session_state.pipeline is None:
+    st.info("Upload and process a PDF to start chatting")
+    st.stop
+
+# ------------------------------------------------------------------------------
+# Chat Interface
+# ------------------------------------------------------------------------------
+
+for msg in st.session_state.messages:
+    with
+
+
+
