@@ -1,14 +1,24 @@
 """
-DocTalk - PDF parser [extracts and chunks text from uploaded PDF files]
+DocTalk — PDF Parser
+Extracts and chunks text from PDFs.
+Fallback chain: pdfplumber → pytesseract OCR → Gemini Vision (for handwriting)
 """
-
+ 
+import base64
 import re
+import tempfile
 from pathlib import Path
-from typing import List
-
+from typing import List, Optional
+ 
 import pdfplumber
-
-def extract_text_by_page(pdf_path: str) -> List[dict]:
+from pdf2image import convert_from_path
+import pytesseract
+from PIL import Image
+import google.generativeai as genai
+ 
+# Confidence threshold — if tesseract avg confidence is below this, use Gemini Vision
+TESSERACT_CONFIDENCE_THRESHOLD = 50
+def extract_text_by_page(pdf_path: str, gemini_api_key: Optional[str] = None) -> List[dict]:
     """
     extract text frpm each page of a pdf, returning the list of page dicts.
 
