@@ -7,11 +7,27 @@ Powered by FAISS + sentence-transformer + Google Gemini.
 import os
 import tempfile
 
-import google.generativeai as genai
+# import google.generativeai as genai ----->updated to new model
+from google import genai
 import streamlit as st
 
 from embeddings import EmbeddingPipeline
 from pdf_parser import parse_pdf
+
+# -------------
+# for testing
+# ------------
+
+import embeddings
+
+print("========== DEBUG ==========")
+print("Embeddings file:", embeddings.__file__)
+print("EmbeddingPipeline:", EmbeddingPipeline)
+print("Has build:", hasattr(EmbeddingPipeline, "build"))
+print("Methods:", [x for x in dir(EmbeddingPipeline) if not x.startswith("_")])
+print("============================")
+
+# -------testing ends-----
 
 # ------------------------------------------------------------------------------
 # Page config
@@ -69,8 +85,11 @@ with st.sidebar:
                     tmp_path = tmp.name
 
                 chunks = parse_pdf(
-                    tmp_path, chunk_size=chunk_size, chunk_overlap=chunk_overlap
-                )    
+                     tmp_path,
+                     chunk_size=chunk_size,
+                     chunk_overlap=chunk_overlap,
+                     gemini_api_key=api_key,
+                    )   
 
                 pipeline = EmbeddingPipeline()
                 pipeline.build(chunks, show_progress=False)
@@ -97,22 +116,13 @@ if not api_key:
 
 if st.session_state.pipeline is None:
     st.info("Upload and process a PDF to start chatting")
-    st.stop
+    st.stop()
 
 # ------------------------------------------------------------------------------
 # Gemini client (initialised once per key)
 # ------------------------------------------------------------------------------
 
-genai.configure(api_key=api_key)
-gemini = genai.GenerativeModel(
-    model_name="gemini-1.5-flash", 
-    system_instruction=(
-        "You are DocTalk, a helpful assistant that answers question strictly "
-        "based on the document passages provided. "
-        "If the answer is not in the passages, say so clearly. "
-        "Always mention the page number(s) your answer comes from."
-    ),
-)
+gemini = genai.Client(api_key=api_key)
 
 
 
@@ -125,7 +135,7 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 if query := st.chat_input("Ask something about the document..."):
-    st.session_state.message.append({"role": "user", "content": query})
+    st.session_state.messages.append({"role": "user", "content": query})
     with st.chat_message("user"):
         st.markdown(query)
 
@@ -140,7 +150,7 @@ if query := st.chat_input("Ask something about the document..."):
             else:
                 # 2. Build context block from retrieved chunks
                 context = "\n\n".join(
-                    f"[Page {r['Page']}]\n{r['text']}" for r in results
+                    f"[Page {r['page']}]\n{r['text']}" for r in results
                 )                
 
                 #3. Send to Gemini
@@ -149,7 +159,11 @@ if query := st.chat_input("Ask something about the document..."):
                     f"Question: {query}"
                 )
                 try:
-                    response = gemini.generate_content(prompt)
+                    response = gemini.models.generate_content(
+                     model="gemini-3.5-flash-lite",
+                     contents=prompt,
+                    )
+
                     answer = response.text
                 except Exception as e:
                     answer = f"Gemini error: {e}"
@@ -166,4 +180,4 @@ if query := st.chat_input("Ask something about the document..."):
                     st.caption(r["text"])
                     st.divider()
 
-    st.session_state.message.append({"role": "assistant", "content":answer})
+    st.session_state.messages.append({"role": "assistant", "content":answer})
