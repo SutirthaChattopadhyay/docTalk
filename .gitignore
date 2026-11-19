@@ -1,4 +1,26 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Secrets
 .env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Private documents and generated indexes
 *.pdf
+test_index/
+*.faiss
+*.index
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/

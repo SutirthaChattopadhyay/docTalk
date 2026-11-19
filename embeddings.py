@@ -30,7 +30,7 @@ class EmbeddingPipeline:
 
     def __init__(self, model_name: str = DEFAULT_MODEL):
         self.model = SentenceTransformer(model_name)
-        self.index: faiss.IndexFlatL2 | None = None
+        self.index: faiss.IndexFlatIP | None = None
         self.metadata: List[dict] = []
 
     # --------------------------------
@@ -58,7 +58,7 @@ class EmbeddingPipeline:
         if show_progress:
             print(
                 f"Encoding {len(texts)} chunks with "
-                f"'{self.model.get_sentence_embedding_dimension()}-dim' embeddings.."
+                f"'{self.model.get_embedding_dimension()}-dim' embeddings.."
             )
 
         embeddings = self.model.encode(
@@ -81,6 +81,7 @@ class EmbeddingPipeline:
                 "chunk_id": c["chunk_id"],
                 "page": c["page"],
                 "text": c["text"],
+                "method": c.get("method", "unknown"),
             }
             for c in chunks
         ]

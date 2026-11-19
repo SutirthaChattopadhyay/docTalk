@@ -1,152 +1,255 @@
+
 """
-DocTalk — PDF Parser
+DocTalk - PDF Parser
+
 Extracts and chunks text from PDFs.
-Fallback chain: pdfplumber → pytesseract OCR → Gemini Vision (for handwriting)
+
+Fallback chain:
+pdfplumber -> Tesseract OCR -> Gemini Vision OCR
 """
- 
-import base64
+
+import io
+import os
 import re
-import tempfile
+import shutil
 from pathlib import Path
 from typing import List, Optional
- 
+
 import pdfplumber
 from pdf2image import convert_from_path
 import pytesseract
+
 from PIL import Image
-import google.generativeai as genai
- 
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
- 
-# Confidence threshold — if tesseract avg confidence is below this, use Gemini Vision
+from google import genai
+from google.genai import types
+
+
+# --------------------------------------------------
+# TESSERACT CONFIGURATION (CROSS-PLATFORM)
+# --------------------------------------------------
+
+# Priority:
+# 1. TESSERACT_CMD environment variable
+# 2. Tesseract executable available on PATH
+# 3. Default Windows installation path
+
+tesseract_cmd = (
+    os.getenv("TESSERACT_CMD")
+    or shutil.which("tesseract")
+)
+
+if not tesseract_cmd and os.name == "nt":
+    windows_tesseract = (
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    )
+
+    if Path(windows_tesseract).is_file():
+        tesseract_cmd = windows_tesseract
+
+if tesseract_cmd:
+    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+
+
+# If Tesseract confidence is below this threshold,
+# Gemini Vision is attempted when an API key is available.
+
 TESSERACT_CONFIDENCE_THRESHOLD = 50
- 
- 
-def extract_text_by_page(pdf_path: str, gemini_api_key: Optional[str] = None) -> List[dict]:
-    """
-    Extract text from each page using a 3-tier fallback:
-      1. pdfplumber   — digital PDFs (fast, perfect accuracy)
-      2. pytesseract  — scanned/printed pages (decent for clean prints)
-      3. Gemini Vision — handwritten or low-confidence pages (best for messy handwriting)
- 
-    Returns:
-        [{"page": int, "text": str, "method": str}, ...]
-    """
+
+
+# --------------------------------------------------
+# TEXT EXTRACTION
+# --------------------------------------------------
+
+def extract_text_by_page(
+    pdf_path: str,
+    gemini_api_key: Optional[str] = None
+) -> List[dict]:
+
     pages = []
- 
+    pil_images = None
+
     with pdfplumber.open(pdf_path) as pdf:
-        pil_images = None  # lazy-load only if needed
- 
+
         for i, page in enumerate(pdf.pages):
             page_num = i + 1
- 
-            # ── Tier 1: pdfplumber ──────────────────────────────────────
-            text = page.extract_text() or ""
-            text = _clean_text(text)
- 
-            if text.strip():
-                pages.append({"page": page_num, "text": text, "method": "pdfplumber"})
+
+            # Tier 1: Digital PDF extraction
+            text = _clean_text(page.extract_text() or "")
+
+            if len(text.strip()) >= 100:
+                pages.append({
+                    "page": page_num,
+                    "text": text,
+                    "method": "pdfplumber"
+                })
                 continue
- 
-            # ── Tier 2: pytesseract ─────────────────────────────────────
+
+            # Tier 2: Local Tesseract OCR
             if pil_images is None:
-                pil_images = convert_from_path(pdf_path, dpi=300)
- 
+                pil_images = convert_from_path(
+                    pdf_path,
+                    dpi=300
+                )
+
             pil_image = pil_images[i]
-            tess_text, confidence = _tesseract_ocr(pil_image)
- 
-            if tess_text.strip() and confidence >= TESSERACT_CONFIDENCE_THRESHOLD:
-                pages.append({"page": page_num, "text": tess_text, "method": "tesseract"})
+
+            tess_text, confidence = _tesseract_ocr(
+                pil_image
+            )
+
+            if (
+                tess_text.strip()
+                and confidence >= TESSERACT_CONFIDENCE_THRESHOLD
+            ):
+                pages.append({
+                    "page": page_num,
+                    "text": tess_text,
+                    "method": "tesseract",
+                    "confidence": confidence
+                })
                 continue
- 
-            # ── Tier 3: Gemini Vision ───────────────────────────────────
+
+            # Tier 3: Gemini Vision OCR fallback
             if gemini_api_key:
-                print(f"Page {page_num}: low OCR confidence ({confidence:.0f}%) — trying Gemini Vision…")
-                gemini_text = _gemini_vision_ocr(pil_image, gemini_api_key)
+
+                print(
+                    f"Page {page_num}: OCR confidence "
+                    f"{confidence:.0f}% - trying Gemini Vision..."
+                )
+
+                gemini_text = _gemini_vision_ocr(
+                    pil_image,
+                    gemini_api_key
+                )
+
                 if gemini_text.strip():
-                    pages.append({"page": page_num, "text": gemini_text, "method": "gemini_vision"})
+                    pages.append({
+                        "page": page_num,
+                        "text": gemini_text,
+                        "method": "gemini_vision"
+                    })
                     continue
- 
-            # All tiers failed — skip page
-            print(f"Page {page_num}: no text extracted, skipping.")
- 
+
+            # Retain digital text if OCR failed
+            if text.strip():
+                pages.append({
+                    "page": page_num,
+                    "text": text,
+                    "method": "pdfplumber"
+                })
+            else:
+                print(
+                    f"Page {page_num}: No text extracted, skipping."
+                )
+
     return pages
 
+
+# --------------------------------------------------
+# TEXT CHUNKING
+# --------------------------------------------------
+
 def chunk_pages(
-        pages: List[dict],
-        chunk_size: int= 500,
-        chunk_overlap: int= 50,
+    pages: List[dict],
+    chunk_size: int = 500,
+    chunk_overlap: int = 50,
 ) -> List[dict]:
-    
-    """
-    splits page texts into overlapping chunks for embedding.
 
-    Args:
-        pages: output of extract_text_by_page()
-        chunk_size: Target chunk size in words.
-        chunk_overlap: number of words to overlap between consecutives chunks.
-
-    Returns:
-        [{"chunk_id": int, "page": int, "text":str}, ...]
     """
-    chunks =[]
-    chunk_id=0
+    Split page text into overlapping word chunks.
+
+    Each chunk retains its page number and extraction method.
+    Whitespace and line breaks are normalized.
+    """
+
+    if chunk_size <= 0:
+        raise ValueError(
+            "chunk_size must be greater than zero"
+        )
+
+    if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+        raise ValueError(
+            "chunk_overlap must be >= 0 and smaller than chunk_size"
+        )
+
+    chunks = []
+    chunk_id = 0
 
     for page_dict in pages:
-        words = page_dict["text"].split()
+
+        text = page_dict["text"].strip()
+
+        if not text:
+            continue
+
+        words = text.split()
         start = 0
 
         while start < len(words):
+
             end = start + chunk_size
+
             chunk_text = " ".join(words[start:end])
-            chunks.append(
-                {
+
+            chunks.append({
                 "chunk_id": chunk_id,
                 "page": page_dict["page"],
                 "text": chunk_text,
-                }
-            )
+                "method": page_dict.get("method", "unknown"),
+            })
+
             chunk_id += 1
-            start += chunk_size - chunk_overlap #side forward with overlap
+            start += chunk_size - chunk_overlap
 
     return chunks
 
+
+# --------------------------------------------------
+# COMPLETE PDF PIPELINE
+# --------------------------------------------------
+
 def parse_pdf(
-        pdf_path: str,
-        chunk_size: int = 500,
-        chunk_overlap: int = 50,
-        gemini_api_key: Optional[str] = None,
+    pdf_path: str,
+    chunk_size: int = 500,
+    chunk_overlap: int = 50,
+    gemini_api_key: Optional[str] = None,
 ) -> List[dict]:
 
     """
-    Full pipeline: extract -> clean -> chunk.
+    Full pipeline: validate -> extract -> chunk.
 
     Args:
         pdf_path: Path to the PDF file.
-        chunk_size: Words per chunk.
-        chunk_overlap: Words to overlap between consecutive chunks.
-        gemini_api_key: Optional Gemini API key for Vision OCR fallback.
+        chunk_size: Number of words per chunk.
+        chunk_overlap: Number of overlapping words.
+        gemini_api_key: Optional Gemini API key for Vision OCR.
 
     Returns:
-        List of chunk dicts with keys: chunk_id, page, text.
+        List of dictionaries containing chunk_id, page,
+        text and extraction method.
     """
 
     path = Path(pdf_path)
 
     if not path.exists():
-        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+        raise FileNotFoundError(
+            f"PDF not found: {pdf_path}"
+        )
 
     if path.suffix.lower() != ".pdf":
-        raise ValueError(f"Expected a .pdf file, got: {path.suffix}")
+        raise ValueError(
+            f"Expected a .pdf file, got: {path.suffix}"
+        )
 
     pages = extract_text_by_page(
-        pdf_path,
+        str(path),
         gemini_api_key=gemini_api_key
     )
 
     if not pages:
         raise ValueError(
-            "No extractable text found. The PDF may be scanned/image based."
+            "No extractable text found. "
+            "The PDF may be scanned or image-based."
         )
 
     chunks = chunk_pages(
@@ -157,68 +260,142 @@ def parse_pdf(
 
     return chunks
 
-"""
-----------------------------
-Internal Helpers
----------------------------
 
-"""
+# --------------------------------------------------
+# INTERNAL HELPERS
+# --------------------------------------------------
+
 def _clean_text(text: str) -> str:
-    """Normalise whitespace and rejoin hyphenated line-breaks."""
+
+    """Normalize whitespace and rejoin hyphenated words."""
+
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"(\w)-\s+(\w)", r"\1\2", text)
+
     return text.strip()
- 
- 
-def _tesseract_ocr(image: Image.Image) -> tuple[str, float]:
+
+
+def _tesseract_ocr(
+    image: Image.Image
+) -> tuple[str, float]:
+
     """
-    Run tesseract on a PIL image.
-    Returns (text, avg_confidence). Confidence is 0-100.
+    Run Tesseract OCR using PSM 3.
+
+    Returns:
+        Extracted text and average OCR confidence (0-100).
     """
+
     try:
-        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
-        confidences = [int(c) for c in data["conf"] if str(c).lstrip("-").isdigit() and int(c) >= 0]
-        avg_conf = sum(confidences) / len(confidences) if confidences else 0
-        text = _clean_text(" ".join(
-            word for word, conf in zip(data["text"], data["conf"])
-            if str(conf).lstrip("-").isdigit() and int(conf) > 0 and word.strip()
-        ))
+
+        data = pytesseract.image_to_data(
+            image,
+            output_type=pytesseract.Output.DICT,
+            config="--oem 3 --psm 3"
+        )
+
+        words_by_line = {}
+        confidences = []
+
+        for word, conf, block, par, line in zip(
+            data["text"],
+            data["conf"],
+            data["block_num"],
+            data["par_num"],
+            data["line_num"]
+        ):
+
+            if (
+                str(conf).lstrip("-").isdigit()
+                and int(conf) > 0
+                and word.strip()
+            ):
+
+                key = (block, par, line)
+
+                words_by_line.setdefault(
+                    key, []
+                ).append(word)
+
+                confidences.append(int(conf))
+
+        avg_conf = (
+            sum(confidences) / len(confidences)
+            if confidences else 0
+        )
+
+        text = "\n".join(
+            " ".join(words)
+            for words in words_by_line.values()
+        )
+
         return text, avg_conf
+
     except Exception as e:
+
         print(f"Tesseract error: {e}")
+
         return "", 0
- 
- 
-def _gemini_vision_ocr(image: Image.Image, api_key: str) -> str:
+
+
+def _gemini_vision_ocr(
+    image: Image.Image,
+    api_key: str
+) -> str:
+
     """
-    Send a page image to Gemini Vision and ask it to transcribe the text.
-    Works well for handwritten content like prescriptions.
+    Use Gemini Vision to transcribe scanned documents.
+
+    Unreadable content should be marked as [unclear].
     """
+
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
- 
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-            image.save(tmp.name, format="JPEG", quality=95)
-            tmp_path = tmp.name
- 
-        with open(tmp_path, "rb") as f:
-            image_bytes = f.read()
- 
-        response = model.generate_content([
-            {
-                "mime_type": "image/jpeg",
-                "data": base64.b64encode(image_bytes).decode("utf-8"),
-            },
-            (
-                "Transcribe all the text in this image exactly as written. "
-                "If it is a medical prescription, extract: patient name, doctor name, "
-                "date, medications (name, dose, frequency), and any instructions. "
-                "Return plain text only, no markdown."
-            ),
-        ])
-        return _clean_text(response.text)
- 
+
+        client = genai.Client(api_key=api_key)
+
+        image_buffer = io.BytesIO()
+
+        image.save(
+            image_buffer,
+            format="JPEG",
+            quality=95
+        )
+
+        image_bytes = image_buffer.getvalue()
+
+        prompt = """
+        Transcribe all readable text in this image accurately.
+
+        Preserve:
+        - Original wording
+        - Names and dates
+        - Numbers and measurements
+        - Medication names and dosages
+        - Instructions and abbreviations
+
+        If something is unreadable, mark it as [unclear].
+        Do not guess missing information.
+
+        Return plain text only.
+        """
+
+        response = client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=[
+                types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type="image/jpeg"
+                ),
+                prompt
+            ]
+        )
+
+        return _clean_text(
+            response.text or ""
+        )
+
     except Exception as e:
+
         print(f"Gemini Vision error: {e}")
+
         return ""
